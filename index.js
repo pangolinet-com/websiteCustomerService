@@ -14,10 +14,9 @@ const CONFIG = {
 
   // 服务
   port: 39527,
-  apiKey: 'sk-pangolin-cs-2024',           // 接口鉴权密钥，调用方需传 Authorization: Bearer <apiKey>
 
-  // CORS 白名单（填你的官网域名，* 表示允许所有）
-  corsOrigins: ['*'],
+  // CORS 白名单（只允许 pangolinfo.com 及其子域名）
+  corsPattern: /^https?:\/\/([a-z0-9-]+\.)*pangolinfo\.com$/,
 
   // 限流
   userRateLimit: { window: 60_000, max: 10 },  // 每用户：60秒10次
@@ -33,25 +32,16 @@ const CONFIG = {
 // CORS
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (CONFIG.corsOrigins.includes('*') || CONFIG.corsOrigins.includes(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+  if (origin && CONFIG.corsPattern.test(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
   }
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
 app.use(express.json({ limit: '10kb' }));
-
-// API Key 鉴权
-function authMiddleware(req, res, next) {
-  const auth = req.headers.authorization;
-  if (!auth || auth !== `Bearer ${CONFIG.apiKey}`) {
-    return res.status(401).json({ error: '未授权，请提供有效的 API Key' });
-  }
-  next();
-}
 
 // ============ 限流器 ============
 const cleanupTimers = []; // 收集定时器，关闭时统一清理
@@ -98,7 +88,7 @@ app.get('/health', (req, res) => {
 });
 
 // ============ 聊天接口 ============
-app.post('/api/chat', authMiddleware, async (req, res) => {
+app.post('/api/chat', async (req, res) => {
   const { userId, message } = req.body;
 
   // 参数校验
@@ -207,7 +197,6 @@ app.post('/api/chat', authMiddleware, async (req, res) => {
 const server = app.listen(CONFIG.port, () => {
   console.log(`中转服务已启动: http://localhost:${CONFIG.port}`);
   console.log(`接口: POST /api/chat`);
-  console.log(`鉴权: Authorization: Bearer ${CONFIG.apiKey}`);
   console.log(`限流: 用户 ${CONFIG.userRateLimit.max}次/${CONFIG.userRateLimit.window / 1000}秒, IP ${CONFIG.ipRateLimit.max}次/${CONFIG.ipRateLimit.window / 1000}秒`);
 });
 
