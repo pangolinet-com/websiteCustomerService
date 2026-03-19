@@ -15,8 +15,8 @@ const CONFIG = {
   // 服务
   port: 39527,
 
-  // CORS 白名单（只允许 pangolinfo.com 及其子域名）
-  corsPattern: /^https?:\/\/([a-z0-9-]+\.)*pangolinfo\.com$/,
+  // CORS 白名单（调试阶段允许所有，上线后改为 /^https?:\/\/([a-z0-9-]+\.)*pangolinfo\.com$/ ）
+  corsPattern: null,
 
   // 限流
   userRateLimit: { window: 60_000, max: 10 },  // 每用户：60秒10次
@@ -32,8 +32,8 @@ const CONFIG = {
 // CORS
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && CONFIG.corsPattern.test(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
+  if (!CONFIG.corsPattern || (origin && CONFIG.corsPattern.test(origin))) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
   }
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
