@@ -133,8 +133,7 @@ app.post('/api/chat', async (req, res) => {
     }, {
       headers: {
         'Authorization': `Bearer ${CONFIG.openclawToken}`,
-        'Content-Type': 'application/json',
-        'x-openclaw-session-key': userId
+        'Content-Type': 'application/json'
       },
       timeout: CONFIG.requestTimeout
     });
