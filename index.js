@@ -119,9 +119,8 @@ app.post('/api/chat', async (req, res) => {
   }
 
   activeSessions.add(userId);
-  const sessionKey = `user:${userId}`;
   const requestId = crypto.randomBytes(4).toString('hex');
-  console.log(`[${requestId}][${sessionKey}] 收到消息: ${message.substring(0, 100)}`);
+  console.log(`[${requestId}][${userId}] 收到消息: ${message.substring(0, 100)}`);
 
   res.setHeader('X-Request-Id', requestId);
 
@@ -129,36 +128,36 @@ app.post('/api/chat', async (req, res) => {
     const response = await axios.post(CONFIG.openclawEndpoint, {
       model: 'openclaw:main',
       messages: [{ role: 'user', content: message }],
-      user: sessionKey,
+      user: userId,
       stream: false
     }, {
       headers: {
         'Authorization': `Bearer ${CONFIG.openclawToken}`,
         'Content-Type': 'application/json',
-        'x-openclaw-session-key': sessionKey
+        'x-openclaw-session-key': userId
       },
       timeout: CONFIG.requestTimeout
     });
 
     activeSessions.delete(userId);
     const content = response.data?.choices?.[0]?.message?.content ?? '';
-    console.log(`[${requestId}][${sessionKey}] 回复: ${content.substring(0, 100)}`);
+    console.log(`[${requestId}][${userId}] 回复: ${content.substring(0, 100)}`);
     return res.json({ reply: content });
 
   } catch (error) {
     activeSessions.delete(userId);
 
     if (error.code === 'ECONNABORTED') {
-      console.error(`[${requestId}][${sessionKey}] 请求超时`);
+      console.error(`[${requestId}][${userId}] 请求超时`);
       return res.status(504).json({ error: '响应超时，请重试' });
     }
 
     if (error.response) {
-      console.error(`[${requestId}][${sessionKey}] OpenClaw 错误 (${error.response.status}):`, error.response.data);
+      console.error(`[${requestId}][${userId}] OpenClaw 错误 (${error.response.status}):`, error.response.data);
       return res.status(502).json({ error: '服务暂时不可用' });
     }
 
-    console.error(`[${requestId}][${sessionKey}] 请求失败:`, error.message);
+    console.error(`[${requestId}][${userId}] 请求失败:`, error.message);
     return res.status(500).json({ error: '服务暂时不可用' });
   }
 });
