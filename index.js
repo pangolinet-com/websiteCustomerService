@@ -9,7 +9,7 @@ const app = express();
 // ============ 配置 ============
 const CONFIG = {
   // OpenClaw
-  openclawEndpoint: 'https://43.134.24.35:19999//v1/chat/completions',
+  openclawEndpoint: 'http://43.134.24.35:19999/v1/chat/completions',
   openclawToken: 'kdyixwjs7nfxnbywnefy6n6kdzzpddn7',
 
   // 服务
