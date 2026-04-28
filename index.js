@@ -9,8 +9,8 @@ const app = express();
 // ============ 配置 ============
 const CONFIG = {
   // OpenClaw
-  openclawEndpoint: 'https://34.56.243.110:18789/v1/chat/completions',
-  openclawToken: 'gqzamr3ifxacyapcnnipzww2wsasiryb',
+  openclawEndpoint: 'https://43.134.24.35:19999//v1/chat/completions',
+  openclawToken: 'kdyixwjs7nfxnbywnefy6n6kdzzpddn7',
 
   // 服务
   port: 39527,
