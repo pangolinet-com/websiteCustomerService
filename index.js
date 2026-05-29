@@ -12,6 +12,15 @@ const CONFIG = {
   openclawEndpoint: 'http://43.134.24.35:19999/v1/chat/completions',
   openclawToken: 'kdyixwjs7nfxnbywnefy6n6kdzzpddn7',
 
+  // 第二个智能体（指纹会话，流式）—— 不同端口、不同 token
+  openclawEndpoint2: 'http://43.134.24.35:18789/v1/chat/completions',
+  openclawToken2: 'wys68ceyyrn4rzert7rrjwkqicx4nzhs',
+
+  // 落库接口（ext-api，存指纹+消息+回复）。persistEndpoint 为空时跳过落库
+  persistEndpoint: 'https://extapi.pangolinfo.com/chat2/message/store',
+  persistToken: '99594168868640efb92be65408c8eeaf',  // 内部密钥，请求头 X-System-Token
+  persistTimeout: 5_000,
+
   // 服务
   port: 39527,
 
@@ -21,6 +30,10 @@ const CONFIG = {
   // 限流
   userRateLimit: { window: 60_000, max: 10 },  // 每用户：60秒10次
   ipRateLimit: { window: 60_000, max: 30 },    // 每IP：60秒30次（一个IP可能有多个用户）
+
+  // chat2 独立限流（基于 fingerprintId，与上面互不影响）
+  fpRateLimit: { window: 60_000, max: 10 },    // 每指纹：60秒10次
+  fpIpRateLimit: { window: 60_000, max: 30 },  // 每IP：60秒30次
 
   // 安全
   maxMessageLength: 2000,    // 单条消息最大字符数
@@ -79,8 +92,13 @@ function createRateLimiter(window, max) {
 const checkUserRate = createRateLimiter(CONFIG.userRateLimit.window, CONFIG.userRateLimit.max);
 const checkIpRate = createRateLimiter(CONFIG.ipRateLimit.window, CONFIG.ipRateLimit.max);
 
+// chat2 专属限流器（基于 fingerprintId，定时器自动并入 cleanupTimers）
+const checkFpRate = createRateLimiter(CONFIG.fpRateLimit.window, CONFIG.fpRateLimit.max);
+const checkFpIpRate = createRateLimiter(CONFIG.fpIpRateLimit.window, CONFIG.fpIpRateLimit.max);
+
 // ============ 并发锁 ============
-const activeSessions = new Set(); // 正在请求中的 userId
+const activeSessions = new Set();  // /api/chat 正在请求中的 userId
+const activeSessions2 = new Set(); // /api/chat2 正在请求中的 fingerprintId
 
 // ============ 健康检查 ============
 app.get('/health', (req, res) => {
@@ -161,11 +179,172 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+// ============ 落库（chat2 流结束后的副作用）============
+// 把完整回复 + 指纹 id 推送给我方后端落库接口。失败只记日志，不影响用户。
+async function persistMessage(fingerprintId, userMessage, reply, requestId) {
+  if (!CONFIG.persistEndpoint) return; // 未配置则跳过
+  try {
+    await axios.post(CONFIG.persistEndpoint, {
+      fingerprintId,
+      message: userMessage,
+      reply
+    }, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-System-Token': CONFIG.persistToken  // 内部密钥，免用户 token
+      },
+      timeout: CONFIG.persistTimeout
+    });
+    console.log(`[${requestId}][${fingerprintId}] 已落库`);
+  } catch (e) {
+    console.error(`[${requestId}][${fingerprintId}] 落库失败:`, e.message);
+  }
+}
+
+// ============ 聊天接口（流式 · 第二个智能体）============
+app.post('/api/chat2', async (req, res) => {
+  const { fingerprintId, message } = req.body;
+
+  // 参数校验
+  if (!fingerprintId || !message) {
+    return res.status(400).json({ error: '缺少 fingerprintId 或 message' });
+  }
+
+  if (typeof message !== 'string' || message.length > CONFIG.maxMessageLength) {
+    return res.status(400).json({ error: `消息长度不能超过 ${CONFIG.maxMessageLength} 字` });
+  }
+
+  // IP 限流（独立计数）
+  const clientIp = req.ip || req.socket.remoteAddress;
+  const ipRetry = checkFpIpRate(clientIp);
+  if (ipRetry !== null) {
+    return res.status(429).json({ error: `IP 请求过于频繁，请 ${ipRetry} 秒后再试`, retryAfter: ipRetry });
+  }
+
+  // 指纹限流
+  const fpRetry = checkFpRate(fingerprintId);
+  if (fpRetry !== null) {
+    return res.status(429).json({ error: `请求过于频繁，请 ${fpRetry} 秒后再试`, retryAfter: fpRetry });
+  }
+
+  // 并发锁：同一指纹同时只能有一个请求
+  if (activeSessions2.has(fingerprintId)) {
+    return res.status(429).json({ error: '上一条消息还在处理中，请稍后再试' });
+  }
+
+  activeSessions2.add(fingerprintId);
+  const requestId = crypto.randomBytes(4).toString('hex');
+  console.log(`[${requestId}][${fingerprintId}] 收到消息(流式): ${message.substring(0, 100)}`);
+
+  let upstream;
+  let fullContent = '';   // 累积完整回复，供落库
+  let buffer = '';        // 跨 chunk 的 SSE 行缓冲
+  let cleaned = false;    // 防止并发锁重复释放
+
+  const release = () => {
+    if (cleaned) return;
+    cleaned = true;
+    activeSessions2.delete(fingerprintId);
+  };
+
+  // 客户端断开：中止上游流，清理并发锁，不落库
+  // 用 res 的 close 而非 req.close —— req.close 在请求体读完时就会触发，会误判为断开
+  res.on('close', () => {
+    if (res.writableEnded) return; // 正常结束，非断开
+    if (upstream?.data) upstream.data.destroy();
+    release();
+    console.log(`[${requestId}][${fingerprintId}] 客户端断开，已中止`);
+  });
+
+  try {
+    upstream = await axios.post(CONFIG.openclawEndpoint2, {
+      model: 'openclaw:main',
+      messages: [{ role: 'user', content: message }],
+      user: fingerprintId,
+      stream: true
+    }, {
+      headers: {
+        'Authorization': `Bearer ${CONFIG.openclawToken2}`,
+        'Content-Type': 'application/json'
+      },
+      responseType: 'stream',
+      // 不设超时：选品分析这类智能体会边调 API 边思考，整轮可能数分钟，
+      // 30 秒会把流掐断（实测会在生成最终报告前 aborted）。
+      // 安全前提：客户端断开时由下方 res.on('close') 销毁上游流并释放并发锁，不会泄漏连接。
+      timeout: 0
+    });
+
+    // 上游已连通，开始 SSE 透传
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Request-Id', requestId);
+    res.flushHeaders();
+
+    upstream.data.on('data', (chunk) => {
+      // 原样透传给前端
+      res.write(chunk);
+
+      // 同时解析增量内容，拼接完整体供落库
+      buffer += chunk.toString('utf8');
+      let idx;
+      while ((idx = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, idx).trim();
+        buffer = buffer.slice(idx + 1);
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]' || payload === '') continue;
+        try {
+          const delta = JSON.parse(payload)?.choices?.[0]?.delta?.content;
+          if (delta) fullContent += delta;
+        } catch {
+          // 非 JSON 行忽略，不影响透传
+        }
+      }
+    });
+
+    upstream.data.on('end', () => {
+      res.end();
+      release();
+      console.log(`[${requestId}][${fingerprintId}] 回复(流式): ${fullContent.substring(0, 100)}`);
+      // 异步落库，不阻塞响应
+      persistMessage(fingerprintId, message, fullContent, requestId);
+    });
+
+    upstream.data.on('error', (err) => {
+      console.error(`[${requestId}][${fingerprintId}] 上游流错误:`, err.message);
+      release();
+      if (!res.writableEnded) {
+        res.write(`event: error\ndata: ${JSON.stringify({ error: '服务暂时不可用' })}\n\n`);
+        res.end();
+      }
+    });
+
+  } catch (error) {
+    release();
+
+    // 此时 SSE 尚未开始（flushHeaders 在 axios 成功之后），可正常返回 JSON 错误
+    if (error.code === 'ECONNABORTED') {
+      console.error(`[${requestId}][${fingerprintId}] 请求超时`);
+      return res.status(504).json({ error: '响应超时，请重试' });
+    }
+
+    if (error.response) {
+      console.error(`[${requestId}][${fingerprintId}] OpenClaw 错误 (${error.response.status})`);
+      return res.status(502).json({ error: '服务暂时不可用' });
+    }
+
+    console.error(`[${requestId}][${fingerprintId}] 请求失败:`, error.message);
+    return res.status(500).json({ error: '服务暂时不可用' });
+  }
+});
+
 // ============ 启动 ============
 const server = app.listen(CONFIG.port, () => {
   console.log(`中转服务已启动: http://localhost:${CONFIG.port}`);
-  console.log(`接口: POST /api/chat`);
+  console.log(`接口: POST /api/chat, POST /api/chat2(流式)`);
   console.log(`限流: 用户 ${CONFIG.userRateLimit.max}次/${CONFIG.userRateLimit.window / 1000}秒, IP ${CONFIG.ipRateLimit.max}次/${CONFIG.ipRateLimit.window / 1000}秒`);
+  console.log(`限流(chat2): 指纹 ${CONFIG.fpRateLimit.max}次/${CONFIG.fpRateLimit.window / 1000}秒, IP ${CONFIG.fpIpRateLimit.max}次/${CONFIG.fpIpRateLimit.window / 1000}秒`);
 });
 
 // 优雅关闭
@@ -176,6 +355,7 @@ function shutdown(signal) {
   console.log(`\n收到 ${signal}，正在关闭服务...`);
   cleanupTimers.forEach(t => clearInterval(t));
   activeSessions.clear();
+  activeSessions2.clear();
   server.close(() => {
     console.log('所有连接已关闭，进程退出');
     process.exit(0);
