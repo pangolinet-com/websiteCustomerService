@@ -24,6 +24,10 @@ const CONFIG = {
   // 服务
   port: 39527,
 
+  // 限流总开关：true=开启所有限流，false=全部跳过（chat + chat2 的 IP/用户/并发锁/指纹数据库判重都不生效）
+  // 线上测试用：关掉后同一指纹/用户/IP 可反复请求，不会被 FP_USED 永久挡住。
+  rateLimitEnabled: false,
+
   // CORS 白名单（调试阶段允许所有，上线后改为 /^https?:\/\/([a-z0-9-]+\.)*pangolinfo\.com$/ ）
   corsPattern: null,
 
@@ -121,22 +125,25 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: `消息长度不能超过 ${CONFIG.maxMessageLength} 字` });
   }
 
-  // IP 限流
-  const clientIp = req.ip || req.socket.remoteAddress;
-  const ipRetry = checkIpRate(clientIp);
-  if (ipRetry !== null) {
-    return res.status(429).json({ error: `IP 请求过于频繁，请 ${ipRetry} 秒后再试`, retryAfter: ipRetry });
-  }
+  // 限流（总开关关闭时全部跳过）
+  if (CONFIG.rateLimitEnabled) {
+    // IP 限流
+    const clientIp = req.ip || req.socket.remoteAddress;
+    const ipRetry = checkIpRate(clientIp);
+    if (ipRetry !== null) {
+      return res.status(429).json({ error: `IP 请求过于频繁，请 ${ipRetry} 秒后再试`, retryAfter: ipRetry });
+    }
 
-  // 用户限流
-  const userRetry = checkUserRate(userId);
-  if (userRetry !== null) {
-    return res.status(429).json({ error: `请求过于频繁，请 ${userRetry} 秒后再试`, retryAfter: userRetry });
-  }
+    // 用户限流
+    const userRetry = checkUserRate(userId);
+    if (userRetry !== null) {
+      return res.status(429).json({ error: `请求过于频繁，请 ${userRetry} 秒后再试`, retryAfter: userRetry });
+    }
 
-  // 并发锁：同一用户同时只能有一个请求
-  if (activeSessions.has(userId)) {
-    return res.status(429).json({ error: '上一条消息还在处理中，请稍后再试' });
+    // 并发锁：同一用户同时只能有一个请求
+    if (activeSessions.has(userId)) {
+      return res.status(429).json({ error: '上一条消息还在处理中，请稍后再试' });
+    }
   }
 
   activeSessions.add(userId);
@@ -234,21 +241,24 @@ app.post('/api/chat2', async (req, res) => {
     return res.status(400).json({ error: `消息长度不能超过 ${CONFIG.maxMessageLength} 字` });
   }
 
-  // IP 限流（5分钟1次，内存；防止狂换指纹绕过）
-  const clientIp = req.ip || req.socket.remoteAddress;
-  const ipRetry = checkFpIpRate(clientIp);
-  if (ipRetry !== null) {
-    return res.status(429).json({ error: `请求过于频繁，请 ${ipRetry} 秒后再试`, retryAfter: ipRetry });
-  }
+  // 限流（总开关关闭时全部跳过：IP 限流 + 并发锁 + 指纹数据库判重）
+  if (CONFIG.rateLimitEnabled) {
+    // IP 限流（5分钟1次，内存；防止狂换指纹绕过）
+    const clientIp = req.ip || req.socket.remoteAddress;
+    const ipRetry = checkFpIpRate(clientIp);
+    if (ipRetry !== null) {
+      return res.status(429).json({ error: `请求过于频繁，请 ${ipRetry} 秒后再试`, retryAfter: ipRetry });
+    }
 
-  // 并发锁：同一指纹同时只能有一个请求（数据库判重前先挡住"还在处理中"的并发）
-  if (activeSessions2.has(fingerprintId)) {
-    return res.status(429).json({ error: '上一条消息还在处理中，请稍后再试' });
-  }
+    // 并发锁：同一指纹同时只能有一个请求（数据库判重前先挡住"还在处理中"的并发）
+    if (activeSessions2.has(fingerprintId)) {
+      return res.status(429).json({ error: '上一条消息还在处理中，请稍后再试' });
+    }
 
-  // 指纹判重：永久只能提问 1 次（已消费过则拒绝，前端据此引导登录）
-  if (await fingerprintUsed(fingerprintId)) {
-    return res.status(200).json({ error: '试用次数已用完，请登录后查看完整对话', code: 'FP_USED' });
+    // 指纹判重：永久只能提问 1 次（已消费过则拒绝，前端据此引导登录）
+    if (await fingerprintUsed(fingerprintId)) {
+      return res.status(200).json({ error: '试用次数已用完，请登录后查看完整对话', code: 'FP_USED' });
+    }
   }
 
   activeSessions2.add(fingerprintId);
@@ -362,8 +372,11 @@ app.post('/api/chat2', async (req, res) => {
 const server = app.listen(CONFIG.port, () => {
   console.log(`中转服务已启动: http://localhost:${CONFIG.port}`);
   console.log(`接口: POST /api/chat, POST /api/chat2(流式)`);
-  console.log(`限流: 用户 ${CONFIG.userRateLimit.max}次/${CONFIG.userRateLimit.window / 1000}秒, IP ${CONFIG.ipRateLimit.max}次/${CONFIG.ipRateLimit.window / 1000}秒`);
-  console.log(`限流(chat2): 指纹永久1次(数据库判重), IP ${CONFIG.fpIpRateLimit.max}次/${CONFIG.fpIpRateLimit.window / 1000}秒`);
+  console.log(`限流总开关: ${CONFIG.rateLimitEnabled ? '【开启】' : '【关闭 —— 所有限流跳过】'}`);
+  if (CONFIG.rateLimitEnabled) {
+    console.log(`限流: 用户 ${CONFIG.userRateLimit.max}次/${CONFIG.userRateLimit.window / 1000}秒, IP ${CONFIG.ipRateLimit.max}次/${CONFIG.ipRateLimit.window / 1000}秒`);
+    console.log(`限流(chat2): 指纹永久1次(数据库判重), IP ${CONFIG.fpIpRateLimit.max}次/${CONFIG.fpIpRateLimit.window / 1000}秒`);
+  }
 });
 
 // 优雅关闭
