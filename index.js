@@ -26,7 +26,7 @@ const CONFIG = {
 
   // 限流总开关：true=开启所有限流，false=全部跳过（chat + chat2 的 IP/用户/并发锁/指纹数据库判重都不生效）
   // 线上测试用：关掉后同一指纹/用户/IP 可反复请求，不会被 FP_USED 永久挡住。
-  rateLimitEnabled: false,
+  rateLimitEnabled: true,
 
   // CORS 白名单（调试阶段允许所有，上线后改为 /^https?:\/\/([a-z0-9-]+\.)*pangolinfo\.com$/ ）
   corsPattern: null,
