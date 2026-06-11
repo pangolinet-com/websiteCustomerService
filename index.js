@@ -37,11 +37,17 @@ const CONFIG = {
 
   // chat2 限流（引流场景）：
   //   指纹 —— 永久只能提问 1 次，靠数据库判重（查 latestByFingerprint，found=true 即已消费），重启不失效
-  //   IP   —— 5 分钟 1 次，内存限流，防止狂换指纹绕过
-  fpIpRateLimit: { window: 300_000, max: 1 },  // 每IP：5分钟1次
+  //   IP   —— 两层内存限流，防止狂换指纹绕过：
+  //           短窗 1 分钟 1 次（防连点），长窗 24 小时 5 次（防一天内反复试用）
+  fpIpRateLimit:    { window: 60_000, max: 1 },      // 每IP：1分钟1次
+  fpIpDailyLimit:   { window: 86_400_000, max: 5 },  // 每IP：24小时5次
 
   // 指纹消费判重查询接口（ext-api，GET ?fingerprintId=xxx，返回 data.found）
   fpCheckEndpoint: 'https://extapi.pangolinfo.com/chat2/message/latestByFingerprint',
+
+  // 报告判重查询接口（ext-api，GET，受 token 保护：转发用户 Authorization，后端按 userId 查最新一条，返回 data.found）
+  // 登录用户「有且只能发一次报告」就靠它：found=true 即已生成过报告。
+  reportCheckEndpoint: 'https://extapi.pangolinfo.com/chat2/message/latest',
 
   // 安全
   maxMessageLength: 2000,    // 单条消息最大字符数
@@ -57,7 +63,7 @@ app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin', origin || '*');
   }
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -100,8 +106,9 @@ function createRateLimiter(window, max) {
 const checkUserRate = createRateLimiter(CONFIG.userRateLimit.window, CONFIG.userRateLimit.max);
 const checkIpRate = createRateLimiter(CONFIG.ipRateLimit.window, CONFIG.ipRateLimit.max);
 
-// chat2 的 IP 限流器（指纹判重走数据库，不在内存做频率限流）
+// chat2 的 IP 限流器（指纹判重走数据库；IP 两层内存频率限流：分钟级 + 天级）
 const checkFpIpRate = createRateLimiter(CONFIG.fpIpRateLimit.window, CONFIG.fpIpRateLimit.max);
+const checkFpIpDaily = createRateLimiter(CONFIG.fpIpDailyLimit.window, CONFIG.fpIpDailyLimit.max);
 
 // ============ 并发锁 ============
 const activeSessions = new Set();  // /api/chat 正在请求中的 userId
@@ -228,6 +235,24 @@ async function fingerprintUsed(fingerprintId) {
   }
 }
 
+// ============ 报告判重（登录用户）============
+// 转发用户的 Authorization 到 ext-api /chat2/message/latest，后端按 userId 查最新一条。
+// found=true 即该用户已生成过报告。
+// 容错与指纹判重【相反】：报告是「有且只能一次」的硬上限，查询失败时【拦住】(返回 true)，
+// 宁可误拦也不让超发。token 无效（401）同样按已用完处理，挡住请求。
+async function reportUsed(authorization, requestId) {
+  try {
+    const resp = await axios.get(CONFIG.reportCheckEndpoint, {
+      headers: { Authorization: authorization },
+      timeout: CONFIG.persistTimeout
+    });
+    return resp.data?.data?.found === true;
+  } catch (e) {
+    console.error(`[${requestId}] 报告判重查询失败，拦住:`, e.message);
+    return true; // 查询失败 → 拦住（硬上限）
+  }
+}
+
 // ============ 聊天接口（流式 · 第二个智能体）============
 app.post('/api/chat2', async (req, res) => {
   const { fingerprintId, message } = req.body;
@@ -241,28 +266,48 @@ app.post('/api/chat2', async (req, res) => {
     return res.status(400).json({ error: `消息长度不能超过 ${CONFIG.maxMessageLength} 字` });
   }
 
-  // 限流（总开关关闭时全部跳过：IP 限流 + 并发锁 + 指纹数据库判重）
-  if (CONFIG.rateLimitEnabled) {
-    // IP 限流（5分钟1次，内存；防止狂换指纹绕过）
-    const clientIp = req.ip || req.socket.remoteAddress;
-    const ipRetry = checkFpIpRate(clientIp);
-    if (ipRetry !== null) {
-      return res.status(429).json({ error: `请求过于频繁，请 ${ipRetry} 秒后再试`, retryAfter: ipRetry });
-    }
+  const requestId = crypto.randomBytes(4).toString('hex');
 
-    // 并发锁：同一指纹同时只能有一个请求（数据库判重前先挡住"还在处理中"的并发）
+  // 登录态判定：带 Authorization: Bearer <jwt> 即视为登录用户的「报告」请求。
+  // 登录用户走另一套闸门——绕开匿名期的 IP 限流和指纹永久判重（哪怕登录前已撞过 IP 墙也放行），
+  // 改用数据库报告判重保证「有且只能发一次报告」。
+  const authorization = req.get('authorization');
+  const isLoggedIn = typeof authorization === 'string' && /^Bearer\s+\S/i.test(authorization);
+
+  // 限流（总开关关闭时全部跳过）
+  if (CONFIG.rateLimitEnabled) {
+    // 并发锁：同一指纹同时只能有一个请求（判重落库前先挡住"还在处理中"的并发）。两条路径都加。
     if (activeSessions2.has(fingerprintId)) {
       return res.status(429).json({ error: '上一条消息还在处理中，请稍后再试' });
     }
 
-    // 指纹判重：永久只能提问 1 次（已消费过则拒绝，前端据此引导登录）
-    if (await fingerprintUsed(fingerprintId)) {
-      return res.status(200).json({ error: '试用次数已用完，请登录后查看完整对话', code: 'FP_USED' });
+    if (isLoggedIn) {
+      // 登录用户：报告判重——有且只能一次。已生成过则拒绝（查询失败也拦住，硬上限）。
+      if (await reportUsed(authorization, requestId)) {
+        return res.status(200).json({ error: '报告已生成，无法重复领取', code: 'REPORT_USED' });
+      }
+    } else {
+      // 匿名用户：IP 两层限流 + 指纹永久判重
+      // IP 限流（内存；防止狂换指纹绕过）：先短窗 1分钟1次，再长窗 24小时5次
+      // 先判短窗：被分钟限流挡住的连点请求不应消耗当天 5 次配额
+      const clientIp = req.ip || req.socket.remoteAddress;
+      const ipRetry = checkFpIpRate(clientIp);
+      if (ipRetry !== null) {
+        return res.status(429).json({ error: `请求过于频繁，请 ${ipRetry} 秒后再试`, retryAfter: ipRetry });
+      }
+      const ipDailyRetry = checkFpIpDaily(clientIp);
+      if (ipDailyRetry !== null) {
+        return res.status(429).json({ error: `今日试用次数已用完，请 ${ipDailyRetry} 秒后再试`, retryAfter: ipDailyRetry });
+      }
+
+      // 指纹判重：永久只能提问 1 次（已消费过则拒绝，前端据此引导登录）
+      if (await fingerprintUsed(fingerprintId)) {
+        return res.status(200).json({ error: '试用次数已用完，请登录后查看完整对话', code: 'FP_USED' });
+      }
     }
   }
 
   activeSessions2.add(fingerprintId);
-  const requestId = crypto.randomBytes(4).toString('hex');
   console.log(`[${requestId}][${fingerprintId}] 收到消息(流式): ${message.substring(0, 100)}`);
 
   let upstream;
@@ -375,7 +420,8 @@ const server = app.listen(CONFIG.port, () => {
   console.log(`限流总开关: ${CONFIG.rateLimitEnabled ? '【开启】' : '【关闭 —— 所有限流跳过】'}`);
   if (CONFIG.rateLimitEnabled) {
     console.log(`限流: 用户 ${CONFIG.userRateLimit.max}次/${CONFIG.userRateLimit.window / 1000}秒, IP ${CONFIG.ipRateLimit.max}次/${CONFIG.ipRateLimit.window / 1000}秒`);
-    console.log(`限流(chat2): 指纹永久1次(数据库判重), IP ${CONFIG.fpIpRateLimit.max}次/${CONFIG.fpIpRateLimit.window / 1000}秒`);
+    console.log(`限流(chat2匿名): 指纹永久1次(数据库判重), IP ${CONFIG.fpIpRateLimit.max}次/${CONFIG.fpIpRateLimit.window / 1000}秒 + ${CONFIG.fpIpDailyLimit.max}次/${CONFIG.fpIpDailyLimit.window / 3600_000}小时`);
+    console.log(`限流(chat2登录): 绕过IP/指纹限流, 报告有且只能1次(数据库判重, 查询失败则拦住)`);
   }
 });
 
