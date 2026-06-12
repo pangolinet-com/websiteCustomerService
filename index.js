@@ -314,10 +314,12 @@ app.post('/api/chat2', async (req, res) => {
   let fullContent = '';   // 累积完整回复，供落库
   let buffer = '';        // 跨 chunk 的 SSE 行缓冲
   let cleaned = false;    // 防止并发锁重复释放
+  let heartbeat = null;   // SSE 心跳定时器
 
   const release = () => {
     if (cleaned) return;
     cleaned = true;
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
     activeSessions2.delete(fingerprintId);
   };
 
@@ -354,6 +356,14 @@ app.post('/api/chat2', async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Request-Id', requestId);
     res.flushHeaders();
+
+    // SSE 心跳：龙虾在思考/等工具结果时上游可能数十秒不吐字节，
+    // 此时连接静默，易被 nginx/负载均衡/浏览器的空闲超时（常见 60s）掐断 → 前端表现为"超时不回复"。
+    // 每 15 秒发一个 SSE 注释行（":" 开头，EventSource 自动忽略，不影响数据解析）保活。
+    heartbeat = setInterval(() => {
+      if (res.writableEnded) return;
+      res.write(': ping\n\n');
+    }, 15_000);
 
     upstream.data.on('data', (chunk) => {
       // 原样透传给前端
