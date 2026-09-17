@@ -10,7 +10,7 @@
 
 ### 产品定位
 
-Pangolin 主营亚马逊电商数据 API（Amazon Scrape API、SERP API、Keyword Trends API、Review API 等）。
+Pangolin 主营亚马逊电商数据 API（Amazon Scraper API、SERP API、Keyword Trends API、Review API 等）。
 
 本项目目标：在官网部署一个 AI 引流助手（"龙虾"），让已登录的潜在客户**免费试用我们的 API 能力**，体验数据价值后引导留资或付费转化。
 
@@ -113,7 +113,7 @@ CREATE TABLE lobster_scenarios (
 
 | slug | name | 主要调用的 Pangolin API |
 |---|---|---|
-| `competitor_analysis` | 竞品分析 | Amazon Scrape API |
+| `competitor_analysis` | 竞品分析 | Amazon Scraper API |
 | `keyword_selection` | 关键词选品 | SERP API + Keyword Trends API |
 | `review_insight` | 评价洞察 | Amazon Review API |
 
@@ -268,7 +268,7 @@ Request Body：
 响应（正常）：
 ```json
 {
-  "reply": "正在调用 Amazon Scrape API...\n\nASIN: B08N5WRWNW\n价格: $39.99...",
+  "reply": "正在调用 Amazon Scraper API...\n\nASIN: B08N5WRWNW\n价格: $39.99...",
   "tokensUsed": 850,
   "tokensRemaining": 99150
 }
